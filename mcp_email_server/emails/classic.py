@@ -1,4 +1,5 @@
 import asyncio
+import base64 as _base64
 import email.utils
 import mimetypes
 import re
@@ -51,6 +52,105 @@ def _validate_flags(flags: list[str]) -> str:
             msg = f"Invalid IMAP flag: {flag!r}"
             raise ValueError(msg)
     return "(" + " ".join(flags) + ")"
+
+
+async def _uid_search_no_charset(
+    imap: aioimaplib.IMAP4 | aioimaplib.IMAP4_SSL,
+    criteria: list[str],
+) -> list[bytes]:
+    """Run UID SEARCH without CHARSET UTF-8.
+
+    aioimaplib's ``uid_search()`` defaults to ``charset='utf-8'``, which
+    Exchange rejects with ``[BADCHARSET]``.  Passing ``charset=None``
+    suppresses the CHARSET token entirely, producing a plain
+    ``UID SEARCH <criteria>`` that every server accepts.
+
+    Returns a list of UID byte strings, e.g. [b'1', b'2', b'42'].
+    """
+    response = await imap.uid_search(*criteria, charset=None)
+    status = _imap_status(response)
+    if status != "OK":
+        raise RuntimeError(f"UID SEARCH failed: {_format_imap_response_detail(response)}")
+
+    uid_bytes: list[bytes] = []
+    for line in response.lines:
+        if not isinstance(line, bytes):
+            continue
+        for token in line.split():
+            if token.isdigit():
+                uid_bytes.append(token)
+    logger.debug(f"UID SEARCH (charset=None) returned {len(uid_bytes)} UIDs")
+    return uid_bytes
+
+
+def _decode_modified_utf7(s: str) -> str:
+    """Decode an IMAP Modified UTF-7 encoded string (RFC 3501).
+
+    Modified UTF-7 encodes non-ASCII characters as &<base64>- where the
+    base64 payload is UTF-16-BE. A lone ampersand is encoded as &-.
+    """
+    result: list[str] = []
+    i = 0
+    while i < len(s):
+        if s[i] == "&":
+            try:
+                j = s.index("-", i + 1)
+            except ValueError:
+                result.append(s[i:])
+                break
+            b64 = s[i + 1 : j]
+            if b64 == "":
+                result.append("&")
+            else:
+                b64_padded = b64 + "=" * ((-len(b64)) % 4)
+                try:
+                    decoded_bytes = _base64.b64decode(b64_padded)
+                    result.append(decoded_bytes.decode("utf-16-be"))
+                except Exception:
+                    result.append(f"&{b64}-")
+            i = j + 1
+        else:
+            result.append(s[i])
+            i += 1
+    return "".join(result)
+
+
+def _parse_imap_list_item(item: bytes) -> tuple[list[str], str, str] | None:
+    """Parse one IMAP LIST response line into (flags, delimiter, name).
+
+    Handles:
+      - Quoted names:   (\\Flag) "/" "Folder Name"
+      - Unquoted atoms: (\\Flag) "/" INBOX
+      - Modified UTF-7 encoded names
+
+    Returns None if the line cannot be parsed.
+    """
+    try:
+        item_str = item.decode("ascii", errors="replace")
+    except Exception:
+        item_str = str(item)
+
+    # Flags
+    flags: list[str] = []
+    flags_match = re.match(r"\(([^)]*)\)", item_str)
+    if flags_match:
+        flags = [f.strip() for f in flags_match.group(1).split() if f.strip()]
+
+    # Delimiter
+    delim_match = re.search(r'\)\s+"(.)"\s', item_str)
+    delimiter = delim_match.group(1) if delim_match else "/"
+
+    # Folder name – quoted
+    name_match = re.search(r'"([^"]+)"\s*$', item_str)
+    if name_match:
+        return flags, delimiter, _decode_modified_utf7(name_match.group(1))
+
+    # Folder name – unquoted atom
+    unquoted_match = re.search(r'"\s+(\S+)\s*$', item_str)
+    if unquoted_match:
+        return flags, delimiter, _decode_modified_utf7(unquoted_match.group(1))
+
+    return None
 
 
 def _quote_mailbox(mailbox: str) -> str:
@@ -659,15 +759,11 @@ class EmailClient:
             )
             logger.info(f"Get metadata: Search criteria: {search_criteria}")
 
-            # Search for messages - use UID SEARCH for better compatibility
-            _, messages = await imap.uid_search(*search_criteria)
-
-            # Handle empty or None responses
-            if not messages or not messages[0]:
-                logger.warning("No messages returned from search")
-                return 0, []
-
-            email_ids = messages[0].split()
+            # Search for messages.
+            # aioimaplib's uid_search() defaults to charset='utf-8', which Exchange
+            # rejects with [BADCHARSET].  Passing charset=None omits the CHARSET
+            # token, producing a plain UID SEARCH that every server accepts.
+            email_ids = await _uid_search_no_charset(imap, search_criteria)
             logger.info(f"Found {len(email_ids)} email IDs")
 
             # Phase 1: Batch fetch INTERNALDATE for sorting (sequential chunks)
@@ -1074,15 +1170,10 @@ class EmailClient:
 
             # Search for folder with \Sent flag
             for folder in folders:
-                folder_str = folder.decode("utf-8") if isinstance(folder, bytes) else str(folder)
-                # IMAP LIST response format: (flags) "delimiter" "name"
-                # Example: (\Sent \HasNoChildren) "/" "Gesendete Objekte"
-                if r"\Sent" in folder_str or "\\Sent" in folder_str:
-                    # Extract folder name from the response
-                    # Split by quotes and get the last quoted part
-                    parts = folder_str.split('"')
-                    if len(parts) >= 3:
-                        folder_name = parts[-2]  # The folder name is the second-to-last quoted part
+                parsed = _parse_imap_list_item(folder) if isinstance(folder, bytes) else None
+                if parsed is not None:
+                    folder_flags, _, folder_name = parsed
+                    if any("Sent" in f for f in folder_flags):
                         logger.info(f"Found Sent folder by \\Sent flag: '{folder_name}'")
                         return folder_name
         except Exception as e:
@@ -1360,16 +1451,9 @@ class EmailClient:
             for item in data:
                 if item == b"":
                     continue
-                item_str = item.decode("utf-8") if isinstance(item, bytes) else str(item)
-                flags = []
-                if "(" in item_str and ")" in item_str:
-                    flags_str = item_str[item_str.index("(") + 1 : item_str.index(")")]
-                    flags = [f.strip() for f in flags_str.split() if f.strip()]
-
-                parts = item_str.split('"')
-                if len(parts) >= 3:
-                    delimiter = parts[1]
-                    folder_name = parts[-2]
+                parsed = _parse_imap_list_item(item) if isinstance(item, bytes) else None
+                if parsed is not None:
+                    flags, delimiter, folder_name = parsed
                     mailboxes.append(MailboxInfo(name=folder_name, delimiter=delimiter, flags=flags))
         finally:
             try:
