@@ -7,12 +7,15 @@ import ssl
 import time
 import unicodedata
 from datetime import datetime, timezone
+from email.generator import BytesGenerator
 from email.header import Header
+from email.message import Message
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.parser import BytesParser
 from email.policy import default
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +55,22 @@ def _validate_flags(flags: list[str]) -> str:
             msg = f"Invalid IMAP flag: {flag!r}"
             raise ValueError(msg)
     return "(" + " ".join(flags) + ")"
+
+
+def _message_to_imap_bytes(msg: Message) -> bytes:
+    """Serialise an email message with CRLF line endings for IMAP APPEND.
+
+    ``Message.as_bytes()`` emits bare ``\\n`` line endings.  IMAP literals
+    (RFC 3501) require ``\\r\\n``.  Some servers — notably Microsoft Exchange —
+    tolerate bare ``\\n`` for tiny messages but desynchronise their literal
+    parser on larger ones (e.g. mails with attachments), treating the message
+    body lines as IMAP commands.  This manifests as ``BAD Command Error`` and a
+    ~10 s-per-attempt hang while the client waits for a tagged response that
+    never arrives.  Always serialise with CRLF to avoid this.
+    """
+    buffer = BytesIO()
+    BytesGenerator(buffer, policy=msg.policy.clone(linesep="\r\n")).flatten(msg)
+    return buffer.getvalue()
 
 
 async def _uid_search_no_charset(
@@ -115,7 +134,7 @@ def _decode_modified_utf7(s: str) -> str:
     return "".join(result)
 
 
-def _parse_imap_list_item(item: bytes) -> tuple[list[str], str, str] | None:
+def _parse_imap_list_item(item: bytes | str) -> tuple[list[str], str, str] | None:
     """Parse one IMAP LIST response line into (flags, delimiter, name).
 
     Handles:
@@ -123,11 +142,15 @@ def _parse_imap_list_item(item: bytes) -> tuple[list[str], str, str] | None:
       - Unquoted atoms: (\\Flag) "/" INBOX
       - Modified UTF-7 encoded names
 
+    Accepts both ``bytes`` (the normal aioimaplib type) and ``str`` items.
     Returns None if the line cannot be parsed.
     """
-    try:
-        item_str = item.decode("ascii", errors="replace")
-    except Exception:
+    if isinstance(item, bytes):
+        try:
+            item_str = item.decode("ascii", errors="replace")
+        except Exception:
+            item_str = str(item)
+    else:
         item_str = str(item)
 
     # Flags
@@ -1170,7 +1193,9 @@ class EmailClient:
 
             # Search for folder with \Sent flag
             for folder in folders:
-                parsed = _parse_imap_list_item(folder) if isinstance(folder, bytes) else None
+                if not isinstance(folder, (bytes, str)):
+                    continue
+                parsed = _parse_imap_list_item(folder)
                 if parsed is not None:
                     folder_flags, _, folder_name = parsed
                     if any("Sent" in f for f in folder_flags):
@@ -1233,8 +1258,10 @@ class EmailClient:
                     # aioimaplib returns (status, data) where status is a string like 'OK' or 'NO'
                     status = result[0] if isinstance(result, tuple) else result
                     if str(status).upper() == "OK":
-                        # Folder exists, append the message
-                        msg_bytes = msg.as_bytes()
+                        # Folder exists, append the message.
+                        # Serialise with CRLF (RFC 3501) — bare \n desyncs some
+                        # servers' literal parsers on larger messages.
+                        msg_bytes = _message_to_imap_bytes(msg)
                         logger.debug(f"Appending message to '{folder}'")
                         # aioimaplib.append signature: (message_bytes, mailbox, flags, date)
                         append_result = await imap.append(
@@ -1295,7 +1322,9 @@ class EmailClient:
                 logger.warning(f"Mailbox '{mailbox}' not found or not selectable: {status}")
                 return None
 
-            msg_bytes = msg.as_bytes()
+            # Serialise with CRLF (RFC 3501) — bare \n desyncs some servers'
+            # literal parsers on larger messages.
+            msg_bytes = _message_to_imap_bytes(msg)
             append_result = await imap.append(
                 msg_bytes,
                 mailbox=_quote_mailbox(mailbox),
@@ -1449,9 +1478,11 @@ class EmailClient:
             _, data = response
 
             for item in data:
-                if item == b"":
+                if item in (b"", ""):
                     continue
-                parsed = _parse_imap_list_item(item) if isinstance(item, bytes) else None
+                if not isinstance(item, (bytes, str)):
+                    continue
+                parsed = _parse_imap_list_item(item)
                 if parsed is not None:
                     flags, delimiter, folder_name = parsed
                     mailboxes.append(MailboxInfo(name=folder_name, delimiter=delimiter, flags=flags))

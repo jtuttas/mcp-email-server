@@ -313,7 +313,7 @@ class TestEmailClient:
         mock_imap.wait_hello_from_server = AsyncMock()
         mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.select = AsyncMock(return_value=("OK", []))
-        mock_imap.uid_search = AsyncMock(return_value=(None, [b"1 2 3"]))
+        mock_imap.uid_search = AsyncMock(return_value=MagicMock(result="OK", lines=[b"1 2 3"]))
         mock_imap.logout = AsyncMock()
 
         # Mock at the helper level - test behavior, not implementation
@@ -380,7 +380,7 @@ class TestEmailClient:
         mock_imap.wait_hello_from_server = AsyncMock()
         mock_imap.login = AsyncMock(return_value=MagicMock(result="OK", lines=[]))
         mock_imap.select = AsyncMock(return_value=("OK", []))
-        mock_imap.uid_search = AsyncMock(return_value=(None, [b"1 2 3"]))
+        mock_imap.uid_search = AsyncMock(return_value=MagicMock(result="OK", lines=[b"1 2 3"]))
         mock_imap.logout = AsyncMock()
 
         mock_metadata = {
